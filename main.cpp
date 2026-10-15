@@ -62,6 +62,7 @@ static int  gCamSpeed   = 64;
 static bool gInvertX    = false;
 static bool gInvertY    = false;
 static bool gLogKeys    = false;
+static bool gCamEnabled = false;   // camera hooks are only installed when 1 (needs game restart)
 
 static const int KEY_F12 = 142;   // reloads the config
 
@@ -111,6 +112,7 @@ static const char *DEFAULT_INI =
     "# to logcat (tag SAKeyboard).\n"
     "\n"
     "[options]\n"
+    "camera_enabled=0\n"
     "camera_speed=64\n"
     "camera_invert_x=0\n"
     "camera_invert_y=0\n"
@@ -165,6 +167,7 @@ static void ApplyLine(std::string line) {
     while (!key.empty() && isspace((unsigned char)key.back())) key.pop_back();
     while (!key.empty() && isspace((unsigned char)key.front())) key.erase(key.begin());
 
+    if (key == "camera_enabled")  { gCamEnabled = atoi(val.c_str()) != 0; return; }
     if (key == "camera_speed")    { gCamSpeed = atoi(val.c_str()); return; }
     if (key == "camera_invert_x") { gInvertX = atoi(val.c_str()) != 0; return; }
     if (key == "camera_invert_y") { gInvertY = atoi(val.c_str()) != 0; return; }
@@ -280,6 +283,23 @@ static uint64_t GenericHook(uint64_t a0, uint64_t a1, uint64_t a2,
     return gOrig[I](a0, a1, a2, a3, a4, a5);
 }
 
+// Camera look functions return a float on the PC/PS2 code this game is based on
+// (about -1..1), not an integer. Returning an integer here leaves garbage in the
+// float register, which is a likely cause of a spinning camera.
+typedef float (*GenericFnF)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+template <int I>
+static float GenericHookF(uint64_t a0, uint64_t a1, uint64_t a2,
+                          uint64_t a3, uint64_t a4, uint64_t a5) {
+    const HookDef &h = HOOKS[I];
+    int dir = (IsHeld(h.a) ? 1 : 0) - (IsHeld(h.b) ? 1 : 0);
+    if (dir != 0) {
+        bool horizontal = (h.a == A_CAM_RIGHT);
+        if (horizontal ? gInvertX : gInvertY) dir = -dir;
+        return (float)dir * ((float)gCamSpeed / 128.0f);
+    }
+    return reinterpret_cast<GenericFnF>(gOrig[I])(a0, a1, a2, a3, a4, a5);
+}
+
 static bool Verify(uintptr_t base, const Fingerprint &fp) {
     return memcmp((const void *)(base + fp.off), fp.bytes, sizeof fp.bytes) == 0;
 }
@@ -288,7 +308,11 @@ template <int I>
 static void InstallOne(uintptr_t base) {
     const HookDef &h = HOOKS[I];
     if (!Verify(base, h.fp)) { LOGE("skip %s: fingerprint mismatch", h.name); return; }
-    aml->Hook((void *)(base + h.fp.off), (void *)&GenericHook<I>, (void **)&gOrig[I]);
+    bool isCam = (h.kind == K_AXIS && h.value < 0);
+    if (isCam && !gCamEnabled) { LOGI("camera hook %s left off (camera_enabled=0)", h.name); return; }
+    void *repl = isCam ? (void *)&GenericHookF<I> : (void *)&GenericHook<I>;
+    aml->Hook((void *)(base + h.fp.off), repl, (void **)&gOrig[I]);
+    LOGI("hooked %s", h.name);
 }
 
 template <int... Is>
